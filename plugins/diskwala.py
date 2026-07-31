@@ -1277,7 +1277,7 @@ async def process_link(app: Client, m: Message, link: str, idx: int, total: int)
             return
 
         try:
-            await msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>")
+            await msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{dreemapplerobot}... {tag}</b>")
             vid_msg = await fetch_via_diskwaladsbot(link)
 
             media = vid_msg.video or vid_msg.document
@@ -1328,7 +1328,7 @@ async def store_video_for_link(app: Client, link: str, status_msg: Message, tag:
         if await get_cache(link):
             return
 
-        await status_msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>")
+        await status_msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{dreemapplerobot}... {tag}</b>")
         vid_msg = await fetch_via_diskwaladsbot(link)
 
         media = vid_msg.video or vid_msg.document
