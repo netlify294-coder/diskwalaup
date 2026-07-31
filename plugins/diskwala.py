@@ -1204,7 +1204,7 @@ async def ignore_cb(_, cq):
 
 async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
     try:
-        await msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>")
+        await msg.edit_text(f"<b>📨  @{@dreemapplerobot}... {tag}</b>")
         vid_msg = await fetch_via_diskwaladsbot(link)
 
         media = vid_msg.video or vid_msg.document
