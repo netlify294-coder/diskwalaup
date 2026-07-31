@@ -40,6 +40,20 @@ API_URL = "https://api2.diskwala.net/api/diskwala/download"
 RE = re.compile(r"https?://(?:www\.)?diskwala\.com/app/[A-Za-z0-9]+")
 CMDS = ["start", "stats", "adddump", "deldump", "dumps", "addpaid", "delpremium", "premium","broadcast", "link", "panel", "checkchannels", "addpost", "delpost", "postchannels"]
 
+_raw_logger = logging.getLogger("raw_updates")
+
+
+@Client.on_message(group=-100)
+async def _debug_catch_all(_, m: Message):
+    """No filters at all — logs literally every message Pyrogram receives,
+    in any chat. If this never fires when you message the bot, Pyrogram
+    itself isn't receiving updates (not a filter/logic bug in our handlers)."""
+    _raw_logger.info(
+        f"[RAW] chat_id={m.chat.id} chat_type={m.chat.type} "
+        f"from={m.from_user.id if m.from_user else '?'} "
+        f"text={(m.text or m.caption or '')!r}"
+    )
+
 
 def is_stale_message(m: Message, max_age_seconds: int = 120) -> bool:
     """After a restart/redeploy, Telegram delivers every message the bot
