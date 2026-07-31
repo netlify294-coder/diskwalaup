@@ -49,5 +49,14 @@ app = Client(
 
 
 if __name__ == "__main__":
+    print("=== bot.py: starting health server (if PORT is set) ===", flush=True)
     _maybe_start_health_server()
-    app.run()
+    print("=== bot.py: calling app.run() now — this loads plugins and connects to Telegram ===", flush=True)
+    try:
+        app.run()
+    except Exception:
+        import traceback
+        print("=== bot.py: app.run() RAISED AN EXCEPTION — bot never started properly ===", flush=True)
+        traceback.print_exc()
+        raise
+    print("=== bot.py: app.run() returned — bot has stopped ===", flush=True)
