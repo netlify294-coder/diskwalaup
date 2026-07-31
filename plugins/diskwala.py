@@ -593,40 +593,43 @@ async def get_init():
 # Diskwala's own API now encrypts its responses, so instead of calling it
 # directly we automate @Diskwaladsbot (a public bot that already handles
 # the fetch/decrypt) via our own userbot account (`tg`, same Telethon
-# session used above). Requests are sent ONE AT A TIME (global lock) and we
-# just take whatever video Diskwaladsbot sends back next as the answer —
-# we don't rely on Telegram's reply-to-message-id, since it's unclear
-# whether Diskwaladsbot actually threads its replies, and mixing multiple
-# in-flight requests caused responses to never get matched at all.
+# session used above). We send it the link, then wait for the video to show
+# up in VIDEO_STORAGE_CHANNEL — which is where Diskwaladsbot is configured
+# (in its own settings, outside our code) to upload every video it fetches.
+# Requests are sent ONE AT A TIME (global lock) so whatever video shows up
+# next in that channel is unambiguously the answer — no reply-matching,
+# and once it lands there our bot can copy it directly to users without
+# ever downloading/re-uploading the file itself.
 DISKWALADSBOT = "Diskwaladsbot"
 _dab_logger = logging.getLogger("diskwaladsbot")
 diskwaladsbot_lock = asyncio.Lock()
-_current_diskwaladsbot_future: asyncio.Future | None = None
+_pending_storage_video: asyncio.Future | None = None
 
 
-@tg.on(events.NewMessage(from_users=DISKWALADSBOT))
-async def _on_diskwaladsbot_reply(event):
-    global _current_diskwaladsbot_future
-    msg = event.message
-    _dab_logger.info(
-        f"received message from @{DISKWALADSBOT}: id={msg.id} reply_to={msg.reply_to_msg_id} "
-        f"has_video={bool(msg.video)} has_document={bool(msg.document)} text={msg.text!r}"
-    )
-    if not (msg.video or msg.document):
-        return
-    if _current_diskwaladsbot_future and not _current_diskwaladsbot_future.done():
-        _dab_logger.info("resolving current pending request with this video")
-        _current_diskwaladsbot_future.set_result(msg)
-    else:
-        _dab_logger.info("got a video but nothing is currently waiting for one — ignoring")
+if VIDEO_STORAGE_CHANNEL:
+    @Client.on_message(filters.chat(VIDEO_STORAGE_CHANNEL) & (filters.video | filters.document))
+    async def _on_new_storage_video(_, m: Message):
+        global _pending_storage_video
+        _dab_logger.info(f"new video in VIDEO_STORAGE_CHANNEL: msg_id={m.id}")
+        if _pending_storage_video and not _pending_storage_video.done():
+            _dab_logger.info("resolving current pending request with this video")
+            _pending_storage_video.set_result(m)
+        else:
+            _dab_logger.info("nothing currently waiting for a video — ignoring")
 
 
-async def fetch_via_diskwaladsbot(link: str, timeout: int = 150):
-    """Sends `link` to @Diskwaladsbot and waits for its video reply.
-    Only one request is ever in flight at a time (across the whole bot),
-    so whatever video comes back next is unambiguously the answer.
-    Raises on timeout or if no reply arrives in time."""
-    global _current_diskwaladsbot_future
+async def fetch_via_diskwaladsbot(link: str, timeout: int = 150) -> Message:
+    """Sends `link` to @Diskwaladsbot (via our userbot account) and waits
+    for the resulting video to appear in VIDEO_STORAGE_CHANNEL. Only one
+    request is ever in flight at a time (across the whole bot), so whatever
+    video shows up next in that channel is unambiguously the answer.
+    Returns the Pyrogram Message already sitting in VIDEO_STORAGE_CHANNEL —
+    callers can copy_message it directly, no download needed.
+    Raises on timeout or if VIDEO_STORAGE_CHANNEL isn't configured."""
+    global _pending_storage_video
+
+    if not VIDEO_STORAGE_CHANNEL:
+        raise Exception("VIDEO_STORAGE_CHANNEL is not set — required for the Diskwaladsbot proxy")
 
     async with diskwaladsbot_lock:
         if not tg.is_connected():
@@ -635,19 +638,22 @@ async def fetch_via_diskwaladsbot(link: str, timeout: int = 150):
 
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
-        _current_diskwaladsbot_future = fut
+        _pending_storage_video = fut
 
         await tg.send_message(DISKWALADSBOT, link)
         _dab_logger.info(f"sent link to @{DISKWALADSBOT}: link={link}")
         try:
             result = await asyncio.wait_for(fut, timeout=timeout)
-            _dab_logger.info("got video reply")
+            _dab_logger.info("got video in storage channel")
             return result
         except asyncio.TimeoutError:
-            _dab_logger.error(f"TIMEOUT waiting for @{DISKWALADSBOT} reply")
-            raise Exception(f"No response from @{DISKWALADSBOT} within {timeout}s")
+            _dab_logger.error(f"TIMEOUT waiting for video in VIDEO_STORAGE_CHANNEL")
+            raise Exception(
+                f"No video appeared in VIDEO_STORAGE_CHANNEL within {timeout}s — "
+                f"check @{DISKWALADSBOT} is configured to upload there"
+            )
         finally:
-            _current_diskwaladsbot_future = None
+            _pending_storage_video = None
 
 from urllib.parse import quote
 import requests
@@ -1185,24 +1191,22 @@ async def ignore_cb(_, cq):
 async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
     try:
         await msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>")
-        tmsg = await fetch_via_diskwaladsbot(link)
+        vid_msg = await fetch_via_diskwaladsbot(link)
 
-        file_name = (tmsg.file.name if tmsg.file else None) or "video.mp4"
-        size = (tmsg.file.size if tmsg.file else 0) or 0
+        media = vid_msg.video or vid_msg.document
+        file_name = (media.file_name if media else None) or "video.mp4"
+        size = (media.file_size if media else 0) or 0
 
-        thumb_path = None
-        try:
-            thumb_path = await tg.download_media(
-                tmsg, thumb=-1,
-                file=os.path.join(DOWNLOAD_DIR, f"preview_{uuid.uuid4().hex[:8]}.jpg"),
-            )
-        except Exception:
-            thumb_path = None
+        thumb_file_id = None
+        if vid_msg.video and vid_msg.video.thumbs:
+            thumb_file_id = vid_msg.video.thumbs[-1].file_id
+        elif vid_msg.document and vid_msg.document.thumbs:
+            thumb_file_id = vid_msg.document.thumbs[-1].file_id
 
         # Send thumbnail as spoiler
-        if thumb_path:
+        if thumb_file_id:
             await m.reply_photo(
-                photo=thumb_path,
+                photo=thumb_file_id,
                 has_spoiler=True,
                 caption=f"""<b>🔒 𝖥𝖱𝖤𝖤 𝖫𝖨𝖬𝖨𝖳 𝖱𝖤𝖠𝖢𝖧𝖤𝖣 {tag}</b>
 
@@ -1222,10 +1226,6 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
             )
 
             await msg.delete()
-            try:
-                os.remove(thumb_path)
-            except Exception:
-                pass
 
         else:
             await msg.edit_text(
@@ -1262,64 +1262,21 @@ async def process_link(app: Client, m: Message, link: str, idx: int, total: int)
         if await try_deliver_from_cache(app, m, msg, link, tag):
             return
 
-        req_dir = os.path.join(DOWNLOAD_DIR, str(m.from_user.id), uuid.uuid4().hex[:8])
-        os.makedirs(req_dir, exist_ok=True)
-
         try:
-            async with download_semaphore:
-                await msg.edit_text(
-                    f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>"
-                )
-                tmsg = await fetch_via_diskwaladsbot(link)
-                await msg.edit_text(f"<b>⬇️ 𝖣𝖮𝖶𝖭𝖫𝖮𝖠𝖣𝖨𝖭𝖦... {tag}</b>")
-                file_path = await tg.download_media(tmsg, file=req_dir + os.sep)
+            await msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>")
+            vid_msg = await fetch_via_diskwaladsbot(link)
 
-            file_name = os.path.basename(file_path)
-            actual_size = os.path.getsize(file_path)
+            media = vid_msg.video or vid_msg.document
+            file_name = (media.file_name if media else None) or "video.mp4"
+            actual_size = (media.file_size if media else 0) or 0
             await add_bandwidth(actual_size)
 
-            info = await get_video_info(file_path)
-            thumb_path = os.path.join(req_dir, "thumb.jpg")
-            thumb = await generate_thumbnail(file_path, thumb_path)
-
-            last_edit = time.time()
-
-            async def progress(current, total_bytes):
-                nonlocal last_edit
-                if time.time() - last_edit > 4:
-                    pct = current * 100 / total_bytes
-                    try:
-                        await msg.edit_text(
-                            f"<b>📤 𝖴𝖯𝖫𝖮𝖠𝖣𝖨𝖭𝖦... {tag}</b>\n\n<code>{file_name}</code>",
-                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                                f"⏳ {pct:.1f}%", callback_data="none")]])
-                        )
-                    except Exception:
-                        pass
-                    last_edit = time.time()
+            await save_cache(link, VIDEO_STORAGE_CHANNEL, vid_msg.id, file_name, actual_size)
 
             dump_ids = await get_dumps()
-
-            upload_kwargs = dict(
-                caption=f"<code>{file_name}</code>",
-                duration=info["duration"], width=info["width"], height=info["height"],
-                thumb=thumb, supports_streaming=True, progress=progress,
-            )
-
+            sent = await app.copy_message(m.chat.id, VIDEO_STORAGE_CHANNEL, vid_msg.id)
             if dump_ids:
-                primary = dump_ids[0]
-                cache_msg = await app.send_video(
-                    primary, file_path,
-                    caption=f"<code>{file_name}</code>",
-                    duration=info["duration"], width=info["width"], height=info["height"],
-                    thumb=thumb, supports_streaming=True, progress=progress,
-                )
-                await save_cache(link, primary, cache_msg.id, file_name, actual_size)
-                sent = await app.copy_message(m.chat.id, primary, cache_msg.id)
-                if dump_ids[1:]:
-                    asyncio.create_task(copy_to_dumps(app, sent, dump_ids[1:]))
-            else:
-                sent = await m.reply_video(file_path, **upload_kwargs)
+                asyncio.create_task(copy_to_dumps(app, sent, dump_ids))
 
             panel = await get_panel_settings()
             await schedule_auto_delete(app, sent.chat.id, sent.id, panel["auto_delete_seconds"])
@@ -1338,9 +1295,6 @@ async def process_link(app: Client, m: Message, link: str, idx: int, total: int)
             except Exception:
                 pass
 
-        finally:
-            shutil.rmtree(req_dir, ignore_errors=True)
-
 RE = re.compile(
     r"https?://(?:www\.)?(?:diskwala\.com/app/[A-Za-z0-9]+|flezen\.com/s/[A-Za-z0-9]+)",
     re.I
@@ -1348,10 +1302,11 @@ RE = re.compile(
 
 
 async def store_video_for_link(app: Client, link: str, status_msg: Message, tag: str):
-    """Downloads a Diskwala/Flezen link (skipping ones already cached) and
-    uploads it to VIDEO_STORAGE_CHANNEL, populating the same shared cache
-    process_link() uses — so later /start deep-link requests for this link
-    are served instantly via cache instead of re-downloading."""
+    """Triggers @Diskwaladsbot for a link (skipping ones already cached) and
+    caches the reference to the video it uploads into VIDEO_STORAGE_CHANNEL
+    — no local download/re-upload needed. Populates the same shared cache
+    process_link() uses, so later /start deep-link requests for this link
+    are served instantly via copy instead of re-fetching."""
     if await get_cache(link):
         return  # already stored previously
 
@@ -1359,37 +1314,15 @@ async def store_video_for_link(app: Client, link: str, status_msg: Message, tag:
         if await get_cache(link):
             return
 
-        req_dir = os.path.join(DOWNLOAD_DIR, "admin_repost", uuid.uuid4().hex[:8])
-        os.makedirs(req_dir, exist_ok=True)
-        try:
-            async with download_semaphore:
-                await status_msg.edit_text(
-                    f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>"
-                )
-                tmsg = await fetch_via_diskwaladsbot(link)
-                await status_msg.edit_text(f"<b>⬇️ 𝖣𝖮𝖶𝖭𝖫𝖮𝖠𝖣𝖨𝖭𝖦... {tag}</b>")
-                file_path = await tg.download_media(tmsg, file=req_dir + os.sep)
+        await status_msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>")
+        vid_msg = await fetch_via_diskwaladsbot(link)
 
-            file_name = os.path.basename(file_path)
-            actual_size = os.path.getsize(file_path)
-            await add_bandwidth(actual_size)
+        media = vid_msg.video or vid_msg.document
+        file_name = (media.file_name if media else None) or "video.mp4"
+        actual_size = (media.file_size if media else 0) or 0
+        await add_bandwidth(actual_size)
 
-            info = await get_video_info(file_path)
-            thumb_path = os.path.join(req_dir, "thumb.jpg")
-            thumb = await generate_thumbnail(file_path, thumb_path)
-
-            await status_msg.edit_text(f"<b>📤 𝖴𝖯𝖫𝖮𝖠𝖣𝖨𝖭𝖦... {tag}</b>\n\n<code>{file_name}</code>")
-
-            stored = await app.send_video(
-                VIDEO_STORAGE_CHANNEL, file_path,
-                caption=f"<code>{file_name}</code>",
-                duration=info["duration"], width=info["width"], height=info["height"],
-                thumb=thumb, supports_streaming=True,
-            )
-            await save_cache(link, VIDEO_STORAGE_CHANNEL, stored.id, file_name, actual_size)
-
-        finally:
-            shutil.rmtree(req_dir, ignore_errors=True)
+        await save_cache(link, VIDEO_STORAGE_CHANNEL, vid_msg.id, file_name, actual_size)
 
 
 @Client.on_message(
