@@ -1419,9 +1419,12 @@ async def _run_admin_repost(app: Client, m: Message, matches):
 
 @Client.on_message(filters.private & (filters.text | filters.caption) & ~filters.command(CMDS))
 async def diskwala(app: Client, m: Message):
+    _dab_logger.info(f"diskwala() invoked: chat={m.chat.id} from={m.from_user.id if m.from_user else '?'} text={(m.text or m.caption or '')!r}")
     if is_stale_message(m):
+        _dab_logger.info("diskwala() skipped — message flagged stale")
         return  # backlog from downtime — skip instead of flooding processing
     links = RE.findall(m.text or m.caption or "")
+    _dab_logger.info(f"diskwala() found links: {links}")
     if not links:
         return
 
