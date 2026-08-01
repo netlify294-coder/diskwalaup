@@ -482,7 +482,9 @@ async def get_link_lock(link: str) -> asyncio.Lock:
 async def try_deliver_from_cache(app: Client, m: Message, msg: Message, link: str, tag: str) -> bool:
     cached = await get_cache(link)
     if not cached:
+        _dab_logger.info(f"cache MISS for link={link!r}")
         return False
+    _dab_logger.info(f"cache HIT for link={link!r}: {cached}")
     try:
         await msg.edit_text(f"<b>⚡ 𝖢𝖠𝖢𝖧𝖤𝖣 — 𝖨𝖭𝖲𝖳𝖠𝖭𝖳 𝖣𝖤𝖫𝖨𝖵𝖤𝖱𝖸 {tag}</b>\n\n<code>{cached['file_name']}</code>")
         sent = await app.copy_message(m.chat.id, cached["chat_id"], cached["message_id"])
@@ -490,7 +492,8 @@ async def try_deliver_from_cache(app: Client, m: Message, msg: Message, link: st
         await schedule_auto_delete(app, sent.chat.id, sent.id, panel["auto_delete_seconds"])
         await msg.delete()
         return True
-    except Exception:
+    except Exception as e:
+        _dab_logger.error(f"cache delivery FAILED for link={link!r}: {type(e).__name__}: {e}")
         return False
 
 
@@ -1409,9 +1412,9 @@ async def store_video_for_link(app: Client, link: str, status_msg: Message, tag:
         await add_bandwidth(actual_size)
 
         await save_cache(link, VIDEO_STORAGE_CHANNEL, vid_msg.id, file_name, actual_size)
-
-
-@Client.on_message(
+        _dab_logger.info(
+            f"cached link={link!r} -> chat_id={VIDEO_STORAGE_CHANNEL!r} message_id={vid_msg.id}"
+        )@Client.on_message(
     filters.private & filters.user(OWNER_ID) & (filters.photo | filters.video) & filters.caption
 )
 async def admin_repost(app: Client, m: Message):
