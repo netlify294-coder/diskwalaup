@@ -1414,7 +1414,10 @@ async def store_video_for_link(app: Client, link: str, status_msg: Message, tag:
         await save_cache(link, VIDEO_STORAGE_CHANNEL, vid_msg.id, file_name, actual_size)
         _dab_logger.info(
             f"cached link={link!r} -> chat_id={VIDEO_STORAGE_CHANNEL!r} message_id={vid_msg.id}"
-        )@Client.on_message(
+        )
+
+
+@Client.on_message(
     filters.private & filters.user(OWNER_ID) & (filters.photo | filters.video) & filters.caption
 )
 async def admin_repost(app: Client, m: Message):
