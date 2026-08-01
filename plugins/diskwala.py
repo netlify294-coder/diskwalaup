@@ -181,7 +181,7 @@ async def buy_and_verify_handler(client: Client, query: CallbackQuery):
                     "3️⃣ 𝖡𝗈𝗍 𝗐𝗂𝗅𝗅 𝗏𝖾𝗋𝗂𝖿𝗒 𝗒𝗈𝗎𝗋 𝗉𝖺𝗒𝗆𝖾𝗇𝗍 𝖺𝗇𝖽 𝖺𝖼𝗍𝗂𝗏𝖺𝗍𝖾 𝗒𝗈𝗎𝗋 𝗉𝗅𝖺𝗇.\n\n"
                     "🗒𝖳𝗁𝗂𝗌 𝖰𝖱 𝖢𝗈𝖽𝖾 𝗐𝗂𝗅𝗅 𝖾𝗑𝗉𝗂𝗋𝖾 𝗂𝗇 5 𝖬𝗂𝗇𝗎𝗍𝖾𝗌. 𝖼𝗈𝗆𝗉𝗅𝖾𝗍𝖾 𝗍𝗁𝖾 𝗉𝖺𝗒𝗆𝖾𝗇𝗍 𝗂𝗇 5 𝗆𝗂𝗇𝗎𝗍𝖾𝗌\n\n"
                     "<blockquote>𝖨𝖿 𝗒𝗈𝗎 𝖺𝗅𝗋𝖾𝖺𝖽𝗒 𝗉𝖺𝗂𝖽 𝗍𝗁𝖾 𝖺𝗆𝗈𝗎𝗇𝗍 𝖺𝗇𝖽 𝗌𝗍𝗂𝗅𝗅 𝗌𝗁𝗈𝗐𝗂𝗇𝗀 𝖯𝖺𝗒𝗆𝖾𝗇𝗍 𝖭𝗈𝗍 𝖥𝗈𝗎𝗇𝖽 𝗍𝗁𝖾𝗇 𝖢𝗈𝗇𝗍𝖺𝖼𝗍 "
-                    "<a href='https://t.me/salesgodx?text=<b>Hey%20my%20order%20ID%20is%20{order_id}.%20\n\nI%20paid%20but%20my%20premium%20is%20not%20activated.</b>'>@salesgodx</a></blockquote></b>"
+                    "<a href='https://t.me/DumpAdminBot?text=<b>Hey%20my%20order%20ID%20is%20{order_id}.%20\n\nI%20paid%20but%20my%20premium%20is%20not%20activated.</b>'>@DumpAdminBot</a></blockquote></b>"
                 ),
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("⏳ 𝖤𝖷𝖯𝖨𝖱𝖤𝖲 𝖨𝖭 05:00", callback_data="none")
@@ -269,7 +269,7 @@ async def buy_and_verify_handler(client: Client, query: CallbackQuery):
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 𝖳𝖱𝖸 𝖠𝖦𝖠𝖨𝖭", callback_data=f"retry_{order_id}")],
-                        [InlineKeyboardButton("🆘 𝖲𝖴𝖯𝖯𝖮𝖱𝖳", url="https://t.me/salesgodx")]
+                        [InlineKeyboardButton("🆘 𝖲𝖴𝖯𝖯𝖮𝖱𝖳", url="https://t.me/DumpAdminBot")]
                     ])
                 )
 
@@ -292,22 +292,27 @@ async def is_subscribed(app: Client, user_id: int) -> bool:
         return False
 
 
-async def create_short_code(links: list[str]) -> str:
+async def create_short_code(links: list[str], kind: str = "video") -> str:
     """Stores one or more links under a short random code and returns it.
     Base64-encoding the raw link(s) easily exceeds Telegram's 64-character
     limit on the start= deep-link parameter (silently dropped if over), so
-    we store the links in Mongo and hand out a short code instead."""
+    we store the links in Mongo and hand out a short code instead.
+    kind="video" (default): resolving delivers actual videos (free-limit
+    applies). kind="raw": resolving just hands back the plain Diskwala/
+    Flezen links as text — no processing, no limit, since it costs nothing."""
     while True:
         code = secrets.token_urlsafe(6)[:8]  # ~8 chars, always well under 64
         if not await shortlinks_col.find_one({"_id": code}):
             break
-    await shortlinks_col.update_one({"_id": code}, {"$set": {"links": links}}, upsert=True)
+    await shortlinks_col.update_one({"_id": code}, {"$set": {"links": links, "kind": kind}}, upsert=True)
     return code
 
 
-async def resolve_short_code(code: str) -> list[str] | None:
+async def resolve_short_code(code: str) -> dict | None:
     doc = await shortlinks_col.find_one({"_id": code})
-    return doc["links"] if doc else None
+    if not doc:
+        return None
+    return {"links": doc["links"], "kind": doc.get("kind", "video")}
 
 
 def join_prompt_markup() -> InlineKeyboardMarkup:
@@ -377,7 +382,11 @@ _DEFAULT_SETTINGS = {
     "button_text": "CHECKOUT ♡",
     "button_url": "",
     "auto_delete_seconds": 0,
-    "caption_template": "<blockquote>“<b>Below is Your Link</b> ↩️\n\n<b>{link}</b>”</blockquote>",
+    "caption_template": (
+        "<blockquote>“<b>Below is Your Link</b> ↩️\n\n"
+        "📎 <b>Diskwala Links:</b> {raw_link}\n"
+        "▶️ <b>Watch Videos:</b> {link}”</blockquote>"
+    ),
 }
 
 
@@ -802,10 +811,12 @@ async def start(app: Client, m: Message):
     # text in case someone pastes a link directly after /start.
     payload = m.text.split(None, 1)[1] if len(m.command) > 1 else ""
     links = RE.findall(payload)
+    kind = "video"
     if not links and payload:
         resolved = await resolve_short_code(payload)
         if resolved:
-            links = resolved
+            links = resolved["links"]
+            kind = resolved["kind"]
 
     if links:
         if not await is_subscribed(app, m.from_user.id):
@@ -814,6 +825,13 @@ async def start(app: Client, m: Message):
                 f"Join @{FORCE_SUB_CHANNEL}, then send your link again.",
                 reply_markup=join_prompt_markup(),
             )
+            return
+
+        if kind == "raw":
+            # Just hand back the plain Diskwala/Flezen links — no download,
+            # no Diskwaladsbot round-trip, so no reason to limit this.
+            links_text = "\n".join(f"<code>{link}</code>" for link in links)
+            await m.reply(f"<b>📎 𝖣𝗂𝗌𝗄𝗐𝖺𝗅𝖺 𝖫𝗂𝗇𝗄𝗌:</b>\n\n{links_text}")
             return
 
         premium = await is_premium(m.from_user.id)
@@ -1147,7 +1165,8 @@ async def panel_set_cb(_, cq: CallbackQuery):
         "button_url": "Send the new <b>button URL</b> (must start with http:// or https://):",
         "auto_delete": "Send the <b>auto-delete time in seconds</b> for videos delivered to users (send <code>0</code> to turn it off):",
         "caption_template": "Send the new <b>repost caption template</b>. Must include <code>{link}</code> "
-                             "where the combined link should go. HTML tags like &lt;b&gt;, &lt;blockquote&gt; work.\n\n"
+                             "(the video-batch link) — you can also use <code>{raw_link}</code> (the free, "
+                             "unlimited raw-Diskwala-links batch). HTML tags like &lt;b&gt;, &lt;blockquote&gt; work.\n\n"
                              "Current:\n<code>" + (await get_panel_settings())["caption_template"].replace("<", "&lt;").replace(">", "&gt;") + "</code>",
     }
     await cq.answer()
@@ -1226,6 +1245,16 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
             except Exception:
                 thumb_path = None
 
+        # Free, unlimited "watch with ads" alternative — just hands back the
+        # raw Diskwala/Flezen link, no download/limit involved.
+        me = await m._client.get_me()
+        raw_code = await create_short_code([link], kind="raw")
+        ads_link = f"https://t.me/{me.username}?start={raw_code}"
+        limit_buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💎 𝖦𝖾𝗍 𝖯𝗋𝖾𝗆𝗂𝗎𝗆", callback_data="buy_premium")],
+            [InlineKeyboardButton("📺 𝖶𝖺𝗍𝖼𝗁 𝗐𝗂𝗍𝗁 𝖠𝖽𝗌", url=ads_link)],
+        ])
+
         # Send thumbnail as spoiler
         if thumb_path:
             await m.reply_photo(
@@ -1240,12 +1269,7 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
 
 𝖴𝗉𝗀𝗋𝖺𝖽𝖾 𝗍𝗈 𝖯𝗋𝖾𝗆𝗂𝗎𝗆 𝖿𝗈𝗋 𝖿𝗎𝗅𝗅 𝖽𝗈𝗐𝗇𝗅𝗈𝖺𝖽𝗌.
 """,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "💎 𝖦𝖾𝗍 𝖯𝗋𝖾𝗆𝗂𝗎𝗆",
-                        callback_data="buy_premium"
-                    )]
-                ])
+                reply_markup=limit_buttons
             )
 
             await msg.delete()
@@ -1262,12 +1286,7 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
 📂 <code>{file_name}</code>
 💾 <code>{size/1048576:.2f} MB</code>
 </blockquote>""",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "💎 𝖦𝖾𝗍 𝖯𝗋𝖾𝗆𝗂𝗎𝗆",
-                        callback_data="buy_premium"
-                    )]
-                ])
+                reply_markup=limit_buttons
             )
 
     except Exception as e:
@@ -1408,17 +1427,22 @@ async def _run_admin_repost(app: Client, m: Message, matches):
                 raise StopPropagation
 
         me = await app.get_me()
-        code = await create_short_code(links)
-        combined_link = f"https://t.me/{me.username}?start={code}"
+        video_code = await create_short_code(links, kind="video")
+        raw_code = await create_short_code(links, kind="raw")
+        video_link = f"https://t.me/{me.username}?start={video_code}"
+        raw_link = f"https://t.me/{me.username}?start={raw_code}"
 
         panel = await get_panel_settings()
-        new_caption = panel["caption_template"].format(link=combined_link)
+        new_caption = panel["caption_template"].format(link=video_link, raw_link=raw_link)
 
-        button_markup = None
+        buttons = []
         if panel["button_url"]:
-            button_markup = InlineKeyboardMarkup(
-                [[InlineKeyboardButton(panel["button_text"], url=panel["button_url"])]]
-            )
+            buttons.append([InlineKeyboardButton(panel["button_text"], url=panel["button_url"])])
+        buttons.append([InlineKeyboardButton(
+            "💎 𝖡𝗎𝗒 𝖯𝗋𝖾𝗆𝗂𝗎𝗆 𝖿𝗈𝗋 𝖣𝗂𝗋𝖾𝖼𝗍 𝖴𝗇𝗅𝗂𝗆𝗂𝗍𝖾𝖽 𝖵𝗂𝖽𝖾𝗈",
+            callback_data="buy_premium"
+        )])
+        button_markup = InlineKeyboardMarkup(buttons)
 
         for channel in post_channels:
             try:
