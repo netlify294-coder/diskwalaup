@@ -857,7 +857,7 @@ async def start(app: Client, m: Message):
             # no Diskwaladsbot round-trip, so no reason to limit this.
             # Plain URLs (no <code>) so Telegram auto-links them — tapping
             # opens the link directly instead of just copying the text.
-            links_text = "\n".join(links)
+            links_text = "\n\n".join(links)
             await m.reply(f"<b>📎 𝖣𝗂𝗌𝗄𝗐𝖺𝗅𝖺 𝖫𝗂𝗇𝗄𝗌:</b>\n\n{links_text}", disable_web_page_preview=True)
             return
 
@@ -890,8 +890,9 @@ async def start(app: Client, m: Message):
 
 @Client.on_message(filters.command("link") & filters.private)
 async def make_deep_link(app: Client, m: Message):
-    """/link <diskwala_url> — generates a shareable deep link that starts
-    the bot and immediately delivers that link's video."""
+    """/link <diskwala_url> — pre-downloads the video into VIDEO_STORAGE_CHANNEL
+    (if not already cached), then generates a shareable deep link that
+    delivers it instantly to anyone who opens it."""
     if len(m.command) < 2:
         return await m.reply(
             "<b>Usage:</b> <code>/link https://www.diskwala.com/app/xxxxx</code>"
@@ -901,13 +902,22 @@ async def make_deep_link(app: Client, m: Message):
     if not RE.match(target):
         return await m.reply("⚠️ That doesn't look like a valid Diskwala/Flezen link.")
 
+    if not VIDEO_STORAGE_CHANNEL:
+        return await m.reply("⚠️ Set VIDEO_STORAGE_CHANNEL env var first.")
+
+    status = await m.reply("<b>⚙️ Preparing link...</b>")
+    try:
+        await store_video_for_link(app, target, status, "[1/1]")
+    except Exception as e:
+        return await status.edit_text(f"<b>❌ Failed</b>\n<code>{e}</code>")
+
     me = await app.get_me()
     code = await create_short_code([target])
     deep_link = f"https://t.me/{me.username}?start={code}"
 
-    await m.reply(
+    await status.edit_text(
         f"<b>🔗 Your deep link:</b>\n<code>{deep_link}</code>\n\n"
-        "Anyone who opens this will start the bot and get this video automatically."
+        "Anyone who opens this will start the bot and get this video instantly."
     )
 
 
@@ -1470,11 +1480,7 @@ async def _run_admin_repost(app: Client, m: Message, matches):
         buttons = []
         if panel["button_url"]:
             buttons.append([InlineKeyboardButton(panel["button_text"], url=panel["button_url"])])
-        buttons.append([InlineKeyboardButton(
-            "💎 𝖡𝗎𝗒 𝖯𝗋𝖾𝗆𝗂𝗎𝗆 𝖿𝗈𝗋 𝖣𝗂𝗋𝖾𝖼𝗍 𝖴𝗇𝗅𝗂𝗆𝗂𝗍𝖾𝖽 𝖵𝗂𝖽𝖾𝗈",
-            callback_data="buy_premium"
-        )])
-        button_markup = InlineKeyboardMarkup(buttons)
+        button_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
         for channel in post_channels:
             try:
