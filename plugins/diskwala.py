@@ -1,4 +1,4 @@
-from pyrogram import Client, filters, StopPropagation
+from pyrogram import Client, filters, StopPropagation, ContinuePropagation
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -1158,7 +1158,7 @@ async def panel_set_cb(_, cq: CallbackQuery):
 async def admin_panel_input(_, m: Message):
     uid = m.from_user.id
     if uid not in pending_admin_input:
-        return  # not answering a panel prompt — let normal handlers process this
+        raise ContinuePropagation  # not a panel answer — let diskwala() etc. handle this message
 
     key = pending_admin_input.pop(uid)
     value = m.text.strip()
@@ -1204,7 +1204,7 @@ async def ignore_cb(_, cq):
 
 async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
     try:
-        await msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{dreemapplerobot}... {tag}</b>")
+        await msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>")
         vid_msg = await fetch_via_diskwaladsbot(link)
 
         media = vid_msg.video or vid_msg.document
@@ -1277,7 +1277,7 @@ async def process_link(app: Client, m: Message, link: str, idx: int, total: int)
             return
 
         try:
-            await msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{dreemapplerobot}... {tag}</b>")
+            await msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>")
             vid_msg = await fetch_via_diskwaladsbot(link)
 
             media = vid_msg.video or vid_msg.document
@@ -1328,7 +1328,7 @@ async def store_video_for_link(app: Client, link: str, status_msg: Message, tag:
         if await get_cache(link):
             return
 
-        await status_msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{dreemapplerobot}... {tag}</b>")
+        await status_msg.edit_text(f"<b>📨 𝖱𝖤𝖰𝖴𝖤𝖲𝖳𝖨𝖭𝖦 𝖵𝖨𝖠 @{DISKWALADSBOT}... {tag}</b>")
         vid_msg = await fetch_via_diskwaladsbot(link)
 
         media = vid_msg.video or vid_msg.document
