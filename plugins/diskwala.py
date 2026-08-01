@@ -23,6 +23,11 @@ user_orders: dict[str, dict] = {}
 active_qr_sessions: dict[int, str] = {}
 user_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
+# message_id -> {"is_photo": bool, "content": str, "markup": InlineKeyboardMarkup}
+# Lets the premium plan-menu's "Back" button restore the limit-reached
+# screen it was opened from (which otherwise gets overwritten by edit_text).
+_limit_screen_cache: dict[int, dict] = {}
+
 # Ensures admin reposts (multiple posts sent back-to-back) are fully
 # completed one at a time — download + upload + repost for post #1 finishes
 # before post #2 starts, so videos never get interleaved/mixed up.
@@ -116,18 +121,26 @@ async def buy_and_verify_handler(client: Client, query: CallbackQuery):
         if row:
             rows.append(row)
 
+        # Only show Back if this menu was opened from a limit-reached screen
+        if query.message.id in _limit_screen_cache:
+            rows.append([InlineKeyboardButton("🔙 𝖡𝖺𝖼𝗄", callback_data="back_to_limit")])
 
-        return await query.message.edit_text(
+        plan_text = (
             "💳 <b>𝗖𝗛𝗢𝗢𝗦𝗘 𝗔 𝗣𝗟𝗔𝗡</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "🏦 <b>𝖯𝖠𝖸𝖳𝖬 • 𝖴𝖯𝖨 • 𝖯𝖧𝖮𝖭𝖤𝖯𝖤 • 𝖦𝖯𝖠𝖸</b>\n\n"
             "✦ Pʀᴇᴍɪᴜᴍ ᴀᴄᴛɪᴠᴀᴛᴇs ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ ᴀғᴛᴇʀ ᴘᴀʏᴍᴇɴᴛ\n"
             "✦ Uɴʟɪᴍɪᴛᴇᴅ ғᴜʟʟ ᴅᴏᴡɴʟᴏᴀᴅs ✅\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "👇 Sᴇʟᴇᴄᴛ ʏᴏᴜʀ ᴘʟᴀɴ:</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(rows)
+            "👇 Sᴇʟᴇᴄᴛ ʏᴏᴜʀ ᴘʟᴀɴ:</b>"
         )
+        markup = InlineKeyboardMarkup(rows)
+
+        # Messages with media (e.g. the thumbnail-preview limit screen) must
+        # use edit_caption — edit_text only works on text-only messages.
+        if query.message.photo or query.message.video:
+            return await query.message.edit_caption(plan_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return await query.message.edit_text(plan_text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
     # -------- RETRY --------
     elif data.startswith("retry_"):
@@ -320,6 +333,18 @@ def join_prompt_markup() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📢 𝖩𝗈𝗂𝗇 𝖢𝗁𝖺𝗇𝗇𝖾𝗅", url=f"https://t.me/{FORCE_SUB_CHANNEL}")],
         [InlineKeyboardButton("🔄 𝖳𝗋𝗒 𝖠𝗀𝖺𝗂𝗇", callback_data="check_sub")],
     ])
+
+
+@Client.on_callback_query(filters.regex("^back_to_limit$"))
+async def back_to_limit_cb(_, query: CallbackQuery):
+    info = _limit_screen_cache.get(query.message.id)
+    if not info:
+        return await query.answer("⚠️ Can't go back — try sending the link again.", show_alert=True)
+    await query.answer()
+    if info["is_photo"]:
+        await query.message.edit_caption(info["content"], parse_mode=ParseMode.HTML, reply_markup=info["markup"])
+    else:
+        await query.message.edit_text(info["content"], parse_mode=ParseMode.HTML, reply_markup=info["markup"])
 
 
 @Client.on_callback_query(filters.regex("^check_sub$"))
@@ -830,8 +855,10 @@ async def start(app: Client, m: Message):
         if kind == "raw":
             # Just hand back the plain Diskwala/Flezen links — no download,
             # no Diskwaladsbot round-trip, so no reason to limit this.
-            links_text = "\n".join(f"<code>{link}</code>" for link in links)
-            await m.reply(f"<b>📎 𝖣𝗂𝗌𝗄𝗐𝖺𝗅𝖺 𝖫𝗂𝗇𝗄𝗌:</b>\n\n{links_text}")
+            # Plain URLs (no <code>) so Telegram auto-links them — tapping
+            # opens the link directly instead of just copying the text.
+            links_text = "\n".join(links)
+            await m.reply(f"<b>📎 𝖣𝗂𝗌𝗄𝗐𝖺𝗅𝖺 𝖫𝗂𝗇𝗄𝗌:</b>\n\n{links_text}", disable_web_page_preview=True)
             return
 
         premium = await is_premium(m.from_user.id)
@@ -1257,10 +1284,7 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
 
         # Send thumbnail as spoiler
         if thumb_path:
-            await m.reply_photo(
-                photo=thumb_path,
-                has_spoiler=True,
-                caption=f"""<b>🔒 𝖥𝖱𝖤𝖤 𝖫𝖨𝖬𝖨𝖳 𝖱𝖤𝖠𝖢𝖧𝖤𝖣 {tag}</b>
+            caption_text = f"""<b>🔒 𝖥𝖱𝖤𝖤 𝖫𝖨𝖬𝖨𝖳 𝖱𝖤𝖠𝖢𝖧𝖤𝖣 {tag}</b>
 
 <blockquote expandable>
 📂 <code>{file_name}</code>
@@ -1268,9 +1292,16 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
 </blockquote>
 
 𝖴𝗉𝗀𝗋𝖺𝖽𝖾 𝗍𝗈 𝖯𝗋𝖾𝗆𝗂𝗎𝗆 𝖿𝗈𝗋 𝖿𝗎𝗅𝗅 𝖽𝗈𝗐𝗇𝗅𝗈𝖺𝖽𝗌.
-""",
+"""
+            limit_msg = await m.reply_photo(
+                photo=thumb_path,
+                has_spoiler=True,
+                caption=caption_text,
                 reply_markup=limit_buttons
             )
+            _limit_screen_cache[limit_msg.id] = {
+                "is_photo": True, "content": caption_text, "markup": limit_buttons,
+            }
 
             await msg.delete()
             try:
@@ -1279,15 +1310,16 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
                 pass
 
         else:
-            await msg.edit_text(
-                f"""<b>🔒 𝖥𝖱𝖤𝖤 𝖫𝖨𝖬𝖨𝖳 𝖱𝖤𝖠𝖢𝖧𝖤𝖣 {tag}</b>
+            text = f"""<b>🔒 𝖥𝖱𝖤𝖤 𝖫𝖨𝖬𝖨𝖳 𝖱𝖤𝖠𝖢𝖧𝖤𝖣 {tag}</b>
 
 <blockquote expandable>
 📂 <code>{file_name}</code>
 💾 <code>{size/1048576:.2f} MB</code>
-</blockquote>""",
-                reply_markup=limit_buttons
-            )
+</blockquote>"""
+            await msg.edit_text(text, reply_markup=limit_buttons)
+            _limit_screen_cache[msg.id] = {
+                "is_photo": False, "content": text, "markup": limit_buttons,
+            }
 
     except Exception as e:
         try:
