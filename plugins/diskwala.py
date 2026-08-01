@@ -1216,10 +1216,20 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
         elif vid_msg.document and vid_msg.document.thumbs:
             thumb_file_id = vid_msg.document.thumbs[-1].file_id
 
-        # Send thumbnail as spoiler
+        thumb_path = None
         if thumb_file_id:
+            try:
+                thumb_path = await m._client.download_media(
+                    thumb_file_id,
+                    file_name=os.path.join(DOWNLOAD_DIR, f"preview_{uuid.uuid4().hex[:8]}.jpg"),
+                )
+            except Exception:
+                thumb_path = None
+
+        # Send thumbnail as spoiler
+        if thumb_path:
             await m.reply_photo(
-                photo=thumb_file_id,
+                photo=thumb_path,
                 has_spoiler=True,
                 caption=f"""<b>🔒 𝖥𝖱𝖤𝖤 𝖫𝖨𝖬𝖨𝖳 𝖱𝖤𝖠𝖢𝖧𝖤𝖣 {tag}</b>
 
@@ -1239,6 +1249,10 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
             )
 
             await msg.delete()
+            try:
+                os.remove(thumb_path)
+            except Exception:
+                pass
 
         else:
             await msg.edit_text(
