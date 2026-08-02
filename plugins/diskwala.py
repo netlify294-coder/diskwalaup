@@ -241,11 +241,6 @@ async def buy_and_verify_handler(client: Client, query: CallbackQuery):
                         "2️⃣ 𝖠𝖿𝗍𝖾𝗋 𝖯𝖺𝗒𝗆𝖾𝗇𝗍, 𝖢𝗅𝗂𝖼𝗄 𝗈𝗇 ✅ 𝖯𝖺𝗒𝗆𝖾𝗇𝗍 𝖣𝗈𝗇𝖾 𝖡𝗎𝗍𝗍𝗈𝗇.\n"
                         "3️⃣ 𝖡𝗈𝗍 𝗐𝗂𝗅𝗅 𝗏𝖾𝗋𝗂𝖿𝗒 𝗒𝗈𝗎𝗋 𝗉𝖺𝗒𝗆𝖾𝗇𝗍 𝖺𝗇𝖽 𝖺𝖼𝗍𝗂𝗏𝖺𝗍𝖾 𝗒𝗈𝗎𝗋 𝗉𝗅𝖺𝗇.\n\n"
                         "🗒𝖳𝗁𝗂𝗌 𝖰𝖱 𝖢𝗈𝖽𝖾 𝗐𝗂𝗅𝗅 𝖾𝗑𝗉𝗂𝗋𝖾 𝗂𝗇 5 𝖬𝗂𝗇𝗎𝗍𝖾𝗌. 𝖼𝗈𝗆𝗉𝗅𝖾𝗍𝖾 𝗍𝗁𝖾 𝗉𝖺𝗒𝗆𝖾𝗇𝗍 𝗂𝗇 5 𝗆𝗂𝗇𝗎𝗍𝖾𝗌\n\n"
-                        # FIX: removed the stray trailing </b> that had no
-                        # matching opening <b> — Telegram's strict HTML
-                        # parser rejected the whole send_photo call with
-                        # "Can't parse entities", so the QR never reached
-                        # the user and the payment flow was fully broken.
                         "<blockquote>𝖨𝖿 𝗒𝗈𝗎 𝖺𝗅𝗋𝖾𝖺𝖽𝗒 𝗉𝖺𝗂𝖽 𝗍𝗁𝖾 𝖺𝗆𝗈𝗎𝗇𝗍 𝖺𝗇𝖽 𝗌𝗍𝗂𝗅𝗅 𝗌𝗁𝗈𝗐𝗂𝗇𝗀 𝖯𝖺𝗒𝗆𝖾𝗇𝗍 𝖭𝗈𝗍 𝖥𝗈𝗎𝗇𝖽 𝗍𝗁𝖾𝗇 𝖢𝗈𝗇𝗍𝖺𝖼𝗍 "
                         "<a href='https://t.me/salesgodx?text=<b>Hey%20my%20order%20ID%20is%20{order_id}.%20\n\nI%20paid%20but%20my%20premium%20is%20not%20activated.</b>'>@salesgodx</a></blockquote>"
                     ),
@@ -635,12 +630,6 @@ async def can_full_download(user_id: int) -> bool:
     return await get_free_used(user_id) < FREE_LIMIT
 
 
-# FIX: this function used to be defined twice (once here with "Get Premium",
-# and again lower down with "Buy Premium" text) — the second definition
-# silently shadowed this one, making this copy permanently dead code. Kept
-# a single definition down below where it's actually used.
-
-
 # ─────────────────────────── VIDEO METADATA ───────────────────────────
 async def get_video_metadata(path: str):
     try:
@@ -708,43 +697,58 @@ async def get_init():
     return unquote(urlparse(r.url).fragment.split("tgWebAppData=", 1)[1].split("&tgWebAppVersion=", 1)[0])
 
 # ── Diskwaladsbot proxy ─────────────────────────────────────────────
-# Diskwala's own API now encrypts its responses, so instead of calling it
-# directly we automate @Diskwaladsbot (a public bot that already handles
-# the fetch/decrypt) via our own userbot account (`tg`, same Telethon
-# session used above). We send it the link, then wait for the video to show
-# up in VIDEO_STORAGE_CHANNEL — which is where Diskwaladsbot is configured
-# (in its own settings, outside our code) to upload every video it fetches.
-# Requests are sent ONE AT A TIME (global lock) so whatever video shows up
-# next in that channel is unambiguously the answer — no reply-matching,
-# and once it lands there our bot can copy it directly to users without
-# ever downloading/re-uploading the file itself.
 DISKWALADSBOT = "Diskwaladsbot"
 _dab_logger = logging.getLogger("diskwaladsbot")
 diskwaladsbot_lock = asyncio.Lock()
 _pending_storage_video: asyncio.Future | None = None
+_pending_request_sent_at: float = 0.0
 
 
 if VIDEO_STORAGE_CHANNEL:
     @Client.on_message(filters.chat(VIDEO_STORAGE_CHANNEL) & (filters.video | filters.document))
     async def _on_new_storage_video(_, m: Message):
         global _pending_storage_video
-        _dab_logger.info(f"new video in VIDEO_STORAGE_CHANNEL: msg_id={m.id}")
+        _dab_logger.info(f"new video in VIDEO_STORAGE_CHANNEL: msg_id={m.id} date={m.date}")
+
         if _pending_storage_video and not _pending_storage_video.done():
+            # FIX (bug: multi-link admin posts getting the wrong/old video):
+            # Previously ANY video landing here was blindly handed to
+            # whatever request was currently pending, with no check that it
+            # actually corresponds to that request. If a request timed out
+            # (150s) and a fresh request for the *next* link was already
+            # in flight, a late-arriving response for the OLD link would
+            # get matched to the NEW link's future — silently attaching the
+            # wrong video to the wrong link in multi-link batches.
+            # Now we reject anything that isn't newer than when we sent the
+            # current request, so stale/late responses can't be mismatched.
+            msg_ts = m.date.timestamp() if hasattr(m.date, "timestamp") else m.date
+            if msg_ts < _pending_request_sent_at - 2:
+                _dab_logger.warning(
+                    f"ignoring STALE video msg_id={m.id} (date={msg_ts}) — "
+                    f"older than current request sent_at={_pending_request_sent_at}"
+                )
+                return
             _dab_logger.info("resolving current pending request with this video")
             _pending_storage_video.set_result(m)
         else:
             _dab_logger.info("nothing currently waiting for a video — ignoring")
 
 
-async def fetch_via_diskwaladsbot(link: str, timeout: int = 150) -> Message:
+async def fetch_via_diskwaladsbot(link: str, timeout: int = 240) -> Message:
     """Sends `link` to @Diskwaladsbot (via our userbot account) and waits
     for the resulting video to appear in VIDEO_STORAGE_CHANNEL. Only one
     request is ever in flight at a time (across the whole bot), so whatever
     video shows up next in that channel is unambiguously the answer.
     Returns the Pyrogram Message already sitting in VIDEO_STORAGE_CHANNEL —
     callers can copy_message it directly, no download needed.
-    Raises on timeout or if VIDEO_STORAGE_CHANNEL isn't configured."""
-    global _pending_storage_video
+    Raises on timeout or if VIDEO_STORAGE_CHANNEL isn't configured.
+
+    NOTE: timeout raised 150s -> 240s. With the old 150s timeout, a slow
+    Diskwaladsbot response for link A could arrive *after* we'd already
+    given up and moved on to requesting link B — that late response for A
+    would then get matched to B's pending future (see the staleness guard
+    in _on_new_storage_video for the second half of this fix)."""
+    global _pending_storage_video, _pending_request_sent_at
 
     if not VIDEO_STORAGE_CHANNEL:
         raise Exception("VIDEO_STORAGE_CHANNEL is not set — required for the Diskwaladsbot proxy")
@@ -757,6 +761,9 @@ async def fetch_via_diskwaladsbot(link: str, timeout: int = 150) -> Message:
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         _pending_storage_video = fut
+        # Set BEFORE sending, and give a couple seconds of slack backward
+        # so we don't reject a video that's legitimately in-flight already.
+        _pending_request_sent_at = time.time() - 2
 
         await tg.send_message(DISKWALADSBOT, link)
         _dab_logger.info(f"sent link to @{DISKWALADSBOT}: link={link}")
@@ -771,7 +778,11 @@ async def fetch_via_diskwaladsbot(link: str, timeout: int = 150) -> Message:
                 f"check @{DISKWALADSBOT} is configured to upload there"
             )
         finally:
-            _pending_storage_video = None
+            # Only clear if we're still the current pending future — avoids
+            # a race where a fast-following request's future gets wiped out
+            # by this (finished/timed-out) request's cleanup.
+            if _pending_storage_video is fut:
+                _pending_storage_video = None
 
 from urllib.parse import quote
 import requests
@@ -788,7 +799,6 @@ def fetch(link, auth):
         "User-Agent": "Mozilla/5.0",
     }
 
-    # Detect service
     if "flezen.com" in link.lower():
         download_api = "https://api2.diskwala.net/api/flezen/download"
         status_api = "https://api2.diskwala.net/api/flezen/status?link="
@@ -796,7 +806,6 @@ def fetch(link, auth):
         download_api = "https://api2.diskwala.net/api/diskwala/download"
         status_api = "https://api2.diskwala.net/api/diskwala/status?link="
 
-    # Start job
     r = requests.post(
         download_api,
         headers=headers,
@@ -809,7 +818,6 @@ def fetch(link, auth):
     if not data.get("ok"):
         raise Exception(data.get("error", "Unknown API Error"))
 
-    # Poll status
     status_url = status_api + quote(link, safe="")
 
     while True:
@@ -841,7 +849,6 @@ def fetch(link, auth):
                     )
                 return default
 
-            # Normalize Flezen response to Diskwala format
             if "flezen.com" in link.lower():
                 return {
                     "name": _pick(file, "name", "fileName", "filename", "title"),
@@ -851,7 +858,6 @@ def fetch(link, auth):
                     "type": file.get("type"),
                 }
 
-            # Diskwala response
             return {
                 "name": _pick(file, "name", "fileName", "filename", "title"),
                 "size": _pick(file, "size", "fileSize", "length"),
@@ -894,16 +900,27 @@ async def run_aria2c(url: str, out_path: str, status_msg: Message, tag: str):
         raise RuntimeError(f"aria2c exited with code {process.returncode}")
 
 
+# ── Peer resolution helper (private-channel "Peer id invalid" fix) ─────
+async def ensure_peer_resolved(app: Client, cid) -> bool:
+    """Forces Pyrogram to fetch/cache a channel's access_hash via get_chat().
+    For PRIVATE channels this cache lives in Pyrogram's session file, which
+    is only populated after some interaction with that peer. On ephemeral
+    hosting this cache can vanish on every redeploy — see the /panel and
+    docstrings elsewhere for the persistent-session fix. Returns True/False
+    so callers can report failures instead of crashing mid-repost."""
+    try:
+        await app.get_chat(cid)
+        return True
+    except Exception as e:
+        _dab_logger.error(f"peer resolution failed for {cid!r}: {type(e).__name__}: {e}")
+        return False
+
+
 # ── Commands ──────────────────────────────────────────────────────
 @Client.on_message(filters.command("start") & filters.private)
 async def start(app: Client, m: Message):
     await db.update_one({"_id": m.from_user.id}, {"$set": {"name": m.from_user.first_name}}, upsert=True)
 
-    # Deep-link support: https://t.me/<bot>?start=<short_code>
-    # The code is generated by /link or the admin repost feature and looked
-    # up in Mongo — this avoids Telegram's 64-char limit on start= that a
-    # raw/encoded Diskwala URL would blow past. We still also check the raw
-    # text in case someone pastes a link directly after /start.
     payload = m.text.split(None, 1)[1] if len(m.command) > 1 else ""
     links = RE.findall(payload)
     kind = "video"
@@ -923,10 +940,6 @@ async def start(app: Client, m: Message):
             return
 
         if kind == "raw":
-            # Just hand back the plain Diskwala/Flezen links — no download,
-            # no Diskwaladsbot round-trip, so no reason to limit this.
-            # Plain URLs (no <code>) so Telegram auto-links them — tapping
-            # opens the link directly instead of just copying the text.
             links_text = "\n\n".join(links)
             await m.reply(f"<b>📎 𝖣𝗂𝗌𝗄𝗐𝖺𝗅𝖺 𝖫𝗂𝗇𝗄𝗌:</b>\n\n{links_text}", disable_web_page_preview=True)
             return
@@ -960,9 +973,6 @@ async def start(app: Client, m: Message):
 
 @Client.on_message(filters.command("link") & filters.private)
 async def make_deep_link(app: Client, m: Message):
-    """/link <diskwala_url> — pre-downloads the video into VIDEO_STORAGE_CHANNEL
-    (if not already cached), then generates a shareable deep link that
-    delivers it instantly to anyone who opens it."""
     if len(m.command) < 2:
         return await m.reply(
             "<b>Usage:</b> <code>/link https://www.diskwala.com/app/xxxxx</code>"
@@ -994,7 +1004,17 @@ async def make_deep_link(app: Client, m: Message):
 @Client.on_message(filters.command("stats") & filters.user(OWNER_ID))
 async def stats(_, m):
     users, dumps, bw = await db.count_documents({}), await get_dumps(), await get_bandwidth()
-    premium_count = await db.count_documents({"premium": True})
+    # FIX (bug: Premium count always showed 0):
+    # add_premium() (used by /addpaid, successful QR payments, and free
+    # trials — i.e. every real path that grants premium) only ever sets a
+    # "premium_until" datetime field. It never sets "premium": True. The
+    # only thing that set "premium": True was set_premium(), which is never
+    # called anywhere in the bot — dead code. So this count was always 0
+    # regardless of how many users actually had active premium.
+    # Now counts users whose premium_until is still in the future, same
+    # logic as is_premium().
+    now = dl.datetime.now(pt.utc)
+    premium_count = await db.count_documents({"premium_until": {"$gt": now}})
     await m.reply(
         f"👥 Users: {users}\n"
         f"💎 Premium: {premium_count}\n"
@@ -1010,32 +1030,28 @@ import re as _re
 _DURATION_RE = _re.compile(r"^(\d+(?:\.\d+)?)([mhdwMy])$")
 
 _DURATION_UNITS = {
-    "m": 1 / 1440,        # minutes → fraction of a day
-    "h": 1 / 24,          # hours → fraction of a day
-    "d": 1,                # days
-    "w": 7,                # weeks
-    "M": 30,                # months (approx)
-    "y": 365,               # years (approx)
+    "m": 1 / 1440,
+    "h": 1 / 24,
+    "d": 1,
+    "w": 7,
+    "M": 30,
+    "y": 365,
 }
 
 
 def parse_duration(text: str) -> float | None:
-    """Parses '7d', '1m', '2h', '3w', '1M', '1y' into a number of days. Returns None if invalid."""
     match = _DURATION_RE.match(text.strip())
     if not match:
         return None
     value, unit = match.groups()
     days = float(value) * _DURATION_UNITS[unit]
-    if not (0 < days <= 3650):  # sanity cap ~10 years
+    if not (0 < days <= 3650):
         return None
     return days
 
 
 @Client.on_message(filters.command("addpaid") & filters.user(OWNER_ID))
 async def addpaid(client, m):
-    """Usage: /addpaid <user_id> <duration>
-    Duration examples: 30m (30 min), 2h (2 hours), 7d (7 days), 2w (2 weeks), 1M (1 month), 1y (1 year)
-    """
     parts = m.text.split()[1:]
     if len(parts) != 2:
         return await m.reply(
@@ -1069,7 +1085,6 @@ async def addpaid(client, m):
     expiry = await get_premium_expiry(uid)
     readable = expiry.astimezone(pt.timezone("Asia/Kolkata")).strftime("%d-%b-%Y %I:%M %p")
 
-    # Notify the user directly — best-effort
     notified = True
     try:
         try:
@@ -1096,7 +1111,6 @@ async def addpaid(client, m):
 
 @Client.on_message(filters.command("delpremium") & filters.user(OWNER_ID))
 async def delpremium(_, m):
-    """Usage: /delpremium <user_id> [user_id...]"""
     parts = m.text.split()[1:]
     if not parts:
         return await m.reply("⚠️ Usage: <code>/delpremium user_id1 user_id2 ...</code>")
@@ -1177,11 +1191,6 @@ async def deldump(_, m):
 
 @Client.on_message(filters.command("checkchannels") & filters.user(OWNER_ID))
 async def check_channels(app: Client, m: Message):
-    """Diagnoses 'Peer id invalid' issues by trying to resolve each
-    configured channel directly and reporting the exact result/error.
-    Also checks every dynamic /addpost channel now — previously this only
-    looked at the two env-var channels, so a private /addpost channel that
-    failed to resolve was invisible here."""
     lines = []
     for label, cid in [("VIDEO_STORAGE_CHANNEL", VIDEO_STORAGE_CHANNEL), ("REPOST_CHANNEL", REPOST_CHANNEL)]:
         if not cid:
@@ -1213,17 +1222,6 @@ async def list_dumps(_, m):
 
 @Client.on_message(filters.command("addpost") & filters.user(OWNER_ID))
 async def addpost(app: Client, m):
-    """FIX (bug: private repost channels failing with 'Peer id invalid'):
-    Adding a channel here used to just store the ID/username in Mongo
-    without ever asking Pyrogram to resolve it. Public channels/usernames
-    tend to resolve fine later via username lookup, but private
-    channels/groups only work once Pyrogram has cached their access_hash —
-    which requires an explicit get_chat() (or some other interaction) at
-    least once. Without that, _run_admin_repost's later send_photo/
-    send_video calls fail with PeerIdInvalid even though the numeric ID is
-    100% correct. Now we resolve (and cache) the peer right when it's
-    added, and tell the admin immediately if that fails (e.g. bot isn't a
-    member/admin of that private channel yet)."""
     parts = m.text.split()[1:]
     if not parts:
         return await m.reply("⚠️ Usage: <code>/addpost -100xxxx channelusername ...</code>")
@@ -1315,7 +1313,7 @@ async def panel_set_cb(_, cq: CallbackQuery):
 async def admin_panel_input(_, m: Message):
     uid = m.from_user.id
     if uid not in pending_admin_input:
-        raise ContinuePropagation  # not a panel answer — let diskwala() etc. handle this message
+        raise ContinuePropagation
 
     key = pending_admin_input.pop(uid)
     value = m.text.strip()
@@ -1326,7 +1324,7 @@ async def admin_panel_input(_, m: Message):
 
     elif key == "button_url":
         if not value.startswith("http://") and not value.startswith("https://"):
-            pending_admin_input[uid] = key  # keep waiting, didn't consume this attempt
+            pending_admin_input[uid] = key
             return await m.reply("⚠️ URL must start with http:// or https://. Try again:")
         await set_panel_setting("button_url", value)
         await m.reply(f"✅ Button URL set to: <code>{value}</code>")
@@ -1395,8 +1393,6 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
             except Exception:
                 thumb_path = None
 
-        # Free, unlimited "watch with ads" alternative — just hands back the
-        # raw Diskwala/Flezen link, no download/limit involved.
         me = await m._client.get_me()
         raw_code = await create_short_code([link], kind="raw")
         ads_link = f"https://t.me/{me.username}?start={raw_code}"
@@ -1405,7 +1401,6 @@ async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
             [InlineKeyboardButton("📺 𝖶𝖺𝗍𝖼𝗁 𝗐𝗂𝗍𝗁 𝖠𝖽𝗌", url=ads_link)],
         ])
 
-        # Send thumbnail as spoiler
         if thumb_path:
             caption_text = f"""<b>🔒 𝖥𝖱𝖤𝖤 𝖫𝖨𝖬𝖨𝖳 𝖱𝖤𝖠𝖢𝖧𝖤𝖣 {tag}</b>
 
@@ -1497,18 +1492,6 @@ async def process_link(app: Client, m: Message, link: str, idx: int, total: int)
 
 
 async def store_video_for_link(app: Client, link: str, status_msg: Message, tag: str):
-    """Triggers @Diskwaladsbot for a link (skipping ones already cached) and
-    caches the reference to the video it uploads into VIDEO_STORAGE_CHANNEL
-    — no local download/re-upload needed. Populates the same shared cache
-    process_link() uses, so later /start deep-link requests for this link
-    are served instantly via copy instead of re-fetching.
-
-    NOTE: relies on the module-level RE regex to extract the link. That
-    regex was previously too narrow ([A-Za-z0-9]+ for the ID) and truncated
-    IDs containing '-'/'_', causing distinct links to collide on the same
-    cache key and return an old cached video instead of fetching the new
-    one. Fixed at the RE definition near the top of this file — no change
-    needed here, this function was just downstream of that bug."""
     if await get_cache(link):
         return  # already stored previously
 
@@ -1533,38 +1516,18 @@ async def store_video_for_link(app: Client, link: str, status_msg: Message, tag:
     filters.private & filters.user(OWNER_ID) & (filters.photo | filters.video) & filters.caption
 )
 async def admin_repost(app: Client, m: Message):
-    """Fast entrypoint — Pyrogram calls this per-message via a limited pool
-    of worker slots (TG_BOT_WORKERS). If we did the downloading/uploading
-    right here, those slots would fill up with admin posts and normal users
-    clicking links would get no response until all posts finished. Instead
-    we hand the real work to a detached background task and return
-    immediately, freeing this worker slot right away for the next update
-    (a user's link, another admin post, etc). The background tasks still
-    serialize themselves via admin_repost_lock so posts don't get mixed."""
     if is_stale_message(m):
-        return  # backlog from downtime — skip instead of flooding processing
+        return
     caption = m.caption or ""
     matches = list(RE.finditer(caption))
     if not matches:
-        return  # no diskwala/flezen links in this post — not for us
+        return
 
     asyncio.create_task(_run_admin_repost(app, m, matches))
     raise StopPropagation
 
 
 async def _run_admin_repost(app: Client, m: Message, matches):
-    """Owner sends/forwards a photo or video post whose caption contains one
-    or more Diskwala/Flezen links. The bot downloads each linked video into
-    VIDEO_STORAGE_CHANNEL, builds a single combined deep-link, and reposts
-    (same media, brand-new caption built from the /panel caption template —
-    original caption text is discarded entirely) into every configured post
-    channel (see /addpost, /delpost, /postchannels).
-
-    Multiple posts sent back-to-back are processed strictly one at a time
-    (admin_repost_lock) — post #1 fully finishes (every link downloaded,
-    uploaded, and reposted) before post #2 starts, so videos never end up
-    mixed between posts. Running as a background task (see admin_repost
-    above) means this queueing never blocks normal users."""
     async with admin_repost_lock:
         post_channels = await get_repost_channels()
         if not VIDEO_STORAGE_CHANNEL or not post_channels:
@@ -1601,19 +1564,26 @@ async def _run_admin_repost(app: Client, m: Message, matches):
         button_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
         # FIX (bug: "Peer id invalid" on private repost channels):
-        # get_chat() forces Pyrogram to resolve/cache the peer (fetching its
-        # access_hash) right before we try to send to it. Public channels
-        # often "just worked" before because username-based lookups resolve
-        # more forgivingly, but private channels/groups need this explicit
-        # resolution — without it Telegram rejects the send with
-        # PeerIdInvalid even when the numeric ID is completely correct.
-        # /addpost now also does this at add-time (see addpost handler),
-        # so this is a second safety net in case the bot's in-memory peer
-        # cache was cleared (e.g. after a restart) since the channel was
-        # added.
+        # get_chat() forces peer resolution before sending, same as before —
+        # but this alone does NOT fix private channels on hosts with an
+        # ephemeral filesystem (e.g. Render free tier): Pyrogram's peer
+        # cache (built from get_chat's access_hash fetch) lives in the
+        # local SQLite session file, which gets wiped on every
+        # redeploy/restart there. So get_chat() itself was failing on
+        # restart because the bot had *never* re-established that peer in
+        # the fresh session.
+        # Fix on a VPS + Coolify: mount a persistent volume for the
+        # Pyrogram session file (and Telethon's StringSession is already
+        # persistent since it's an env var) so the peer cache survives
+        # restarts/redeploys — see deployment notes. get_chat() below is
+        # now wrapped via ensure_peer_resolved() so a resolution failure is
+        # reported per-channel instead of raising and skipping the rest.
+        failed_channels = []
         for channel in post_channels:
+            if not await ensure_peer_resolved(app, channel):
+                failed_channels.append(channel)
+                continue
             try:
-                await app.get_chat(channel)
                 if m.photo:
                     await app.send_photo(
                         channel, m.photo.file_id, caption=new_caption,
@@ -1630,9 +1600,15 @@ async def _run_admin_repost(app: Client, m: Message, matches):
                     f"(If this is a private channel/group, make sure the bot is a member/admin there.)"
                 )
 
-        await status.edit_text(
-            f"<b>✅ Stored {total} video(s) and reposted to {len(post_channels)} channel(s).</b>"
-        )
+        result_text = f"<b>✅ Stored {total} video(s) and reposted to {len(post_channels) - len(failed_channels)}/{len(post_channels)} channel(s).</b>"
+        if failed_channels:
+            result_text += (
+                "\n\n⚠️ Couldn't resolve these channels (peer cache lost — "
+                "see /checkchannels, and make sure the session file/volume "
+                "is persistent on your VPS):\n" +
+                "\n".join(f"• <code>{c}</code>" for c in failed_channels)
+            )
+        await status.edit_text(result_text)
 
 
 
@@ -1641,7 +1617,7 @@ async def diskwala(app: Client, m: Message):
     _dab_logger.info(f"diskwala() invoked: chat={m.chat.id} from={m.from_user.id if m.from_user else '?'} text={(m.text or m.caption or '')!r}")
     if is_stale_message(m):
         _dab_logger.info("diskwala() skipped — message flagged stale")
-        return  # backlog from downtime — skip instead of flooding processing
+        return
     links = RE.findall(m.text or m.caption or "")
     _dab_logger.info(f"diskwala() found links: {links}")
     if not links:
@@ -1663,7 +1639,6 @@ async def diskwala(app: Client, m: Message):
     tasks = []
 
     if premium or used < FREE_LIMIT:
-        # Whole batch (1 or many links) counts as a single free use.
         for i, link in enumerate(links):
             tasks.append(process_link(app, m, link, i + 1, total))
         await asyncio.gather(*tasks, return_exceptions=True)
