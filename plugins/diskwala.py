@@ -42,20 +42,7 @@ tg = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 
 BOT_USERNAME, APP_SHORT_NAME = "sky577bot", "open"
 API_URL = "https://api2.diskwala.net/api/diskwala/download"
-
-# FIX (bug: multi-link posts grabbing the wrong/old video batch):
-# The old regex only matched [A-Za-z0-9]+ for the link ID, which truncates
-# real Diskwala/Flezen IDs that contain '-' or '_'. Two different links
-# sharing the same prefix up to the first '-'/'_' were extracted down to the
-# *same* truncated string, so the cache (keyed on this extracted link) would
-# report a false HIT for a brand-new link and hand back an old cached video
-# instead of fetching the new one. Widened to [\w-]+ (letters, digits,
-# underscore, hyphen) so distinct IDs stay distinct. If Diskwala/Flezen IDs
-# ever include other characters (e.g. '.'), extend this class too.
-RE = re.compile(
-    r"https?://(?:www\.)?(?:diskwala\.com/app/[\w-]+|flezen\.com/s/[\w-]+)",
-    re.I
-)
+RE = re.compile(r"https?://(?:www\.)?diskwala\.com/app/[A-Za-z0-9]+")
 CMDS = ["start", "stats", "adddump", "deldump", "dumps", "addpaid", "delpremium", "premium","broadcast", "link", "panel", "checkchannels", "addpost", "delpost", "postchannels"]
 
 _raw_logger = logging.getLogger("raw_updates")
@@ -99,7 +86,7 @@ _link_locks: dict[str, asyncio.Lock] = {}
 _locks_guard = asyncio.Lock()
 
 # ── Free-tier / premium config ───────────────────────────────────
-FREE_LIMIT = 5  # number of full downloads a non-premium user gets before stream-only mode
+FREE_LIMIT = 10  # number of full downloads a non-premium user gets before stream-only mode
 
 
 async def update_qr_timer(client, msg, order_id, orders, sessions, user_id, total_seconds=300):
@@ -142,7 +129,7 @@ async def buy_and_verify_handler(client: Client, query: CallbackQuery):
             "💳 <b>𝗖𝗛𝗢𝗢𝗦𝗘 𝗔 𝗣𝗟𝗔𝗡</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "🏦 <b>𝖯𝖠𝖸𝖳𝖬 • 𝖴𝖯𝖨 • 𝖯𝖧𝖮𝖭𝖤𝖯𝖤 • 𝖦𝖯𝖠𝖸</b>\n\n"
-            "✦ Pʀᴇᴍɪᴜᴍ ᴀᴄᴛɪᴠᴀᴛᴇs ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʏ ᴀғᴛᴇʀ ᴘᴀʏᴍᴇɴᴛ\n"
+            "✦ Pʀᴇᴍɪᴜᴍ ᴀᴄᴛɪᴠᴀᴛᴇs ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ ᴀғᴛᴇʀ ᴘᴀʏᴍᴇɴᴛ\n"
             "✦ Uɴʟɪᴍɪᴛᴇᴅ ғᴜʟʟ ᴅᴏᴡɴʟᴏᴀᴅs ✅\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "👇 Sᴇʟᴇᴄᴛ ʏᴏᴜʀ ᴘʟᴀɴ:</b>"
@@ -154,32 +141,6 @@ async def buy_and_verify_handler(client: Client, query: CallbackQuery):
         if query.message.photo or query.message.video:
             return await query.message.edit_caption(plan_text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return await query.message.edit_text(plan_text, parse_mode=ParseMode.HTML, reply_markup=markup)
-
-    # -------- FREE TRIAL --------
-    # FIX: this callback_data was matched by the handler's regex filter but
-    # had no branch handling it — tapping the button (if such a button is
-    # ever wired up elsewhere) silently did nothing. _free_trial_used was
-    # declared as a "fast-path cache" but was never read or written anywhere.
-    # Wired up a minimal one-time-per-user free trial using that same set
-    # (backed by a DB flag so it survives restarts) — adjust TRIAL_DAYS to
-    # whatever your actual trial length should be.
-    elif data == "free_trial":
-        TRIAL_DAYS = 1
-        if user_id in _free_trial_used:
-            return await query.answer("⚠️ You've already used your free trial.", show_alert=True)
-
-        doc = await db.find_one({"_id": user_id})
-        if doc and doc.get("free_trial_used"):
-            _free_trial_used.add(user_id)
-            return await query.answer("⚠️ You've already used your free trial.", show_alert=True)
-
-        await add_premium(user_id, TRIAL_DAYS)
-        await db.update_one({"_id": user_id}, {"$set": {"free_trial_used": True}}, upsert=True)
-        _free_trial_used.add(user_id)
-
-        expiry = await get_premium_expiry(user_id)
-        readable = expiry.astimezone(pt.timezone("Asia/Kolkata")).strftime("%d-%b-%Y %I:%M %p")
-        return await query.answer(f"🎉 Free trial activated until {readable}!", show_alert=True)
 
     # -------- RETRY --------
     elif data.startswith("retry_"):
@@ -209,66 +170,38 @@ async def buy_and_verify_handler(client: Client, query: CallbackQuery):
                 "used": False, "account": account_used,
             }
 
-            # FIX (bug: user stuck permanently on "pending payment"):
-            # Everything from here down that can raise (QR generation,
-            # sticker/photo send, etc.) is now wrapped in try/except. Before
-            # this fix, active_qr_sessions[user_id] was set *before* any of
-            # this ran, but only ever cleared inside check() — which never
-            # gets created if something above it throws. That left the user
-            # permanently blocked by the "pending payment" guard above until
-            # a bot restart. Now any failure here rolls the session back.
-            try:
-                upi = (f"upi://pay?pa={PAYMENT_ACCOUNTS[account_used]['upi']}&pn=Premium"
-                       f"&am={amount}&cu=INR&tn={order_id}&tr={order_id}")
+            upi = (f"upi://pay?pa={PAYMENT_ACCOUNTS[account_used]['upi']}&pn=Premium"
+                   f"&am={amount}&cu=INR&tn={order_id}&tr={order_id}")
+            
+            wait_qrmsg = await query.message.reply_sticker("CAACAgEAAxkBAAEBXB9qWOBi8ijl1-QJYCBjIhOd1xsrFAACPAoAAsesyEaOswABHsPR5XQeBA")
 
-                wait_qrmsg = await query.message.reply_sticker("CAACAgEAAxkBAAEBXB9qWOBi8ijl1-QJYCBjIhOd1xsrFAACPAoAAsesyEaOswABHsPR5XQeBA")
+            qr = qrcode.make(upi)
+            bio = io.BytesIO(); bio.name = "qr.png"
+            qr.save(bio); bio.seek(0)
 
-                qr = qrcode.make(upi)
-                bio = io.BytesIO(); bio.name = "qr.png"
-                qr.save(bio); bio.seek(0)
-
-                msg = await client.send_photo(
-                    query.message.chat.id, bio,
-                    caption=(
-                        "<blockquote>✦ <b>𝖯𝗅𝖾𝖺𝗌𝖾 𝖼𝗈𝗆𝗉𝗅𝖾𝗍𝖾 𝗍𝗁𝖾 𝖿𝗈𝗅𝗅𝗈𝗐𝗂𝗇𝗀 𝗉𝖺𝗒𝗆𝖾𝗇𝗍:</b></blockquote>\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"❐ <b>𝖠𝖬𝖮𝖴𝖭𝖳 :</b>  {plan['price']}\n"
-                        f"≡ <b>𝖯𝖫𝖠𝖭 :</b>  {plan['label']}\n"
-                        f"❐ <b>𝖮𝖱𝖣𝖤𝖱 𝖨𝖣 :</b>  <code>{order_id}</code>\n\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
-                        "<b>⏳𝖥𝗈𝗅𝗅𝗈𝗐 𝗍𝗁𝖾 𝖨𝗇𝗌𝗍𝗋𝗎𝖼𝗍𝗂𝗈𝗇:-</b>\n"
-                        "1️⃣ 𝖲𝖼𝖺𝗇 𝗍𝗁𝖾 𝖰𝖱 𝖺𝗇𝖽 𝗉𝖺𝗒 𝗍𝗁𝖾 𝖺𝗆𝗈𝗎𝗇𝗍.\n"
-                        "2️⃣ 𝖠𝖿𝗍𝖾𝗋 𝖯𝖺𝗒𝗆𝖾𝗇𝗍, 𝖢𝗅𝗂𝖼𝗄 𝗈𝗇 ✅ 𝖯𝖺𝗒𝗆𝖾𝗇𝗍 𝖣𝗈𝗇𝖾 𝖡𝗎𝗍𝗍𝗈𝗇.\n"
-                        "3️⃣ 𝖡𝗈𝗍 𝗐𝗂𝗅𝗅 𝗏𝖾𝗋𝗂𝖿𝗒 𝗒𝗈𝗎𝗋 𝗉𝖺𝗒𝗆𝖾𝗇𝗍 𝖺𝗇𝖽 𝖺𝖼𝗍𝗂𝗏𝖺𝗍𝖾 𝗒𝗈𝗎𝗋 𝗉𝗅𝖺𝗇.\n\n"
-                        "🗒𝖳𝗁𝗂𝗌 𝖰𝖱 𝖢𝗈𝖽𝖾 𝗐𝗂𝗅𝗅 𝖾𝗑𝗉𝗂𝗋𝖾 𝗂𝗇 5 𝖬𝗂𝗇𝗎𝗍𝖾𝗌. 𝖼𝗈𝗆𝗉𝗅𝖾𝗍𝖾 𝗍𝗁𝖾 𝗉𝖺𝗒𝗆𝖾𝗇𝗍 𝗂𝗇 5 𝗆𝗂𝗇𝗎𝗍𝖾𝗌\n\n"
-                        # FIX: removed the stray trailing </b> that had no
-                        # matching opening <b> — Telegram's strict HTML
-                        # parser rejected the whole send_photo call with
-                        # "Can't parse entities", so the QR never reached
-                        # the user and the payment flow was fully broken.
-                        "<blockquote>𝖨𝖿 𝗒𝗈𝗎 𝖺𝗅𝗋𝖾𝖺𝖽𝗒 𝗉𝖺𝗂𝖽 𝗍𝗁𝖾 𝖺𝗆𝗈𝗎𝗇𝗍 𝖺𝗇𝖽 𝗌𝗍𝗂𝗅𝗅 𝗌𝗁𝗈𝗐𝗂𝗇𝗀 𝖯𝖺𝗒𝗆𝖾𝗇𝗍 𝖭𝗈𝗍 𝖥𝗈𝗎𝗇𝖽 𝗍𝗁𝖾𝗇 𝖢𝗈𝗇𝗍𝖺𝖼𝗍 "
-                        "<a href='https://t.me/salesgodx?text=<b>Hey%20my%20order%20ID%20is%20{order_id}.%20\n\nI%20paid%20but%20my%20premium%20is%20not%20activated.</b>'>@salesgodx</a></blockquote>"
-                    ),
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("⏳ 𝖤𝖷𝖯𝖨𝖱𝖤𝖲 𝖨𝖭 05:00", callback_data="none")
-                    ]]),
-                    parse_mode=ParseMode.HTML
-                )
-                await wait_qrmsg.delete()
-
-            except Exception as e:
-                # Roll back so the user isn't stuck behind the "pending
-                # payment" guard forever.
-                active_qr_sessions.pop(user_id, None)
-                user_orders.pop(order_id, None)
-                try:
-                    await query.message.reply(
-                        f"<b>❌ Couldn't generate the payment QR.</b>\n<code>{e}</code>\n\n"
-                        f"Please try again."
-                    )
-                except Exception:
-                    pass
-                return
+            msg = await client.send_photo(
+                query.message.chat.id, bio,
+                caption=(
+                    "<blockquote>✦ <b>𝖯𝗅𝖾𝖺𝗌𝖾 𝖼𝗈𝗆𝗉𝗅𝖾𝗍𝖾 𝗍𝗁𝖾 𝖿𝗈𝗅𝗅𝗈𝗐𝗂𝗇𝗀 𝗉𝖺𝗒𝗆𝖾𝗇𝗍:</b></blockquote>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"❐ <b>𝖠𝖬𝖮𝖴𝖭𝖳 :</b>  {plan['price']}\n"
+                    f"≡ <b>𝖯𝖫𝖠𝖭 :</b>  {plan['label']}\n"
+                    f"❐ <b>𝖮𝖱𝖣𝖤𝖱 𝖨𝖣 :</b>  <code>{order_id}</code>\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "<b>⏳𝖥𝗈𝗅𝗅𝗈𝗐 𝗍𝗁𝖾 𝖨𝗇𝗌𝗍𝗋𝗎𝖼𝗍𝗂𝗈𝗇:-</b>\n"
+                    "1️⃣ 𝖲𝖼𝖺𝗇 𝗍𝗁𝖾 𝖰𝖱 𝖺𝗇𝖽 𝗉𝖺𝗒 𝗍𝗁𝖾 𝖺𝗆𝗈𝗎𝗇𝗍.\n"
+                    "2️⃣ 𝖠𝖿𝗍𝖾𝗋 𝖯𝖺𝗒𝗆𝖾𝗇𝗍, 𝖢𝗅𝗂𝖼𝗄 𝗈𝗇 ✅ 𝖯𝖺𝗒𝗆𝖾𝗇𝗍 𝖣𝗈𝗇𝖾 𝖡𝗎𝗍𝗍𝗈𝗇.\n"
+                    "3️⃣ 𝖡𝗈𝗍 𝗐𝗂𝗅𝗅 𝗏𝖾𝗋𝗂𝖿𝗒 𝗒𝗈𝗎𝗋 𝗉𝖺𝗒𝗆𝖾𝗇𝗍 𝖺𝗇𝖽 𝖺𝖼𝗍𝗂𝗏𝖺𝗍𝖾 𝗒𝗈𝗎𝗋 𝗉𝗅𝖺𝗇.\n\n"
+                    "🗒𝖳𝗁𝗂𝗌 𝖰𝖱 𝖢𝗈𝖽𝖾 𝗐𝗂𝗅𝗅 𝖾𝗑𝗉𝗂𝗋𝖾 𝗂𝗇 5 𝖬𝗂𝗇𝗎𝗍𝖾𝗌. 𝖼𝗈𝗆𝗉𝗅𝖾𝗍𝖾 𝗍𝗁𝖾 𝗉𝖺𝗒𝗆𝖾𝗇𝗍 𝗂𝗇 5 𝗆𝗂𝗇𝗎𝗍𝖾𝗌\n\n"
+                    "<blockquote>𝖨𝖿 𝗒𝗈𝗎 𝖺𝗅𝗋𝖾𝖺𝖽𝗒 𝗉𝖺𝗂𝖽 𝗍𝗁𝖾 𝖺𝗆𝗈𝗎𝗇𝗍 𝖺𝗇𝖽 𝗌𝗍𝗂𝗅𝗅 𝗌𝗁𝗈𝗐𝗂𝗇𝗀 𝖯𝖺𝗒𝗆𝖾𝗇𝗍 𝖭𝗈𝗍 𝖥𝗈𝗎𝗇𝖽 𝗍𝗁𝖾𝗇 𝖢𝗈𝗇𝗍𝖺𝖼𝗍 "
+                    "<a href='https://t.me/DumpAdminBot?text=<b>Hey%20my%20order%20ID%20is%20{order_id}.%20\n\nI%20paid%20but%20my%20premium%20is%20not%20activated.</b>'>@DumpAdminBot</a></blockquote></b>"
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⏳ 𝖤𝖷𝖯𝖨𝖱𝖤𝖲 𝖨𝖭 05:00", callback_data="none")
+                ]]),
+                parse_mode=ParseMode.HTML
+            )
+            await wait_qrmsg.delete()
 
             asyncio.create_task(
                 update_qr_timer(client, msg, order_id, user_orders, active_qr_sessions, user_id, total_seconds=300)
@@ -349,7 +282,7 @@ async def buy_and_verify_handler(client: Client, query: CallbackQuery):
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 𝖳𝖱𝖸 𝖠𝖦𝖠𝖨𝖭", callback_data=f"retry_{order_id}")],
-                        [InlineKeyboardButton("🆘 𝖲𝖴𝖯𝖯𝖮𝖱𝖳", url="https://t.me/salesgodx")]
+                        [InlineKeyboardButton("🆘 𝖲𝖴𝖯𝖯𝖮𝖱𝖳", url="https://t.me/DumpAdminBot")]
                     ])
                 )
 
@@ -635,10 +568,10 @@ async def can_full_download(user_id: int) -> bool:
     return await get_free_used(user_id) < FREE_LIMIT
 
 
-# FIX: this function used to be defined twice (once here with "Get Premium",
-# and again lower down with "Buy Premium" text) — the second definition
-# silently shadowed this one, making this copy permanently dead code. Kept
-# a single definition down below where it's actually used.
+def premium_prompt_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 𝖦𝖾𝗍 𝖯𝗋𝖾𝗆𝗂𝗎𝗆", callback_data="buy_premium")],
+    ])
 
 
 # ─────────────────────────── VIDEO METADATA ───────────────────────────
@@ -1118,7 +1051,6 @@ async def delpremium(_, m):
         text += f"❌ Invalid IDs: <code>{', '.join(failed)}</code>"
     await m.reply(text or "Nothing to remove.")
 
-
 def premium_prompt_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💎 𝖡𝗎𝗒 𝖯𝗋𝖾𝗆𝗂𝗎𝗆", callback_data="buy_premium")],
@@ -1178,10 +1110,7 @@ async def deldump(_, m):
 @Client.on_message(filters.command("checkchannels") & filters.user(OWNER_ID))
 async def check_channels(app: Client, m: Message):
     """Diagnoses 'Peer id invalid' issues by trying to resolve each
-    configured channel directly and reporting the exact result/error.
-    Also checks every dynamic /addpost channel now — previously this only
-    looked at the two env-var channels, so a private /addpost channel that
-    failed to resolve was invisible here."""
+    configured channel directly and reporting the exact result/error."""
     lines = []
     for label, cid in [("VIDEO_STORAGE_CHANNEL", VIDEO_STORAGE_CHANNEL), ("REPOST_CHANNEL", REPOST_CHANNEL)]:
         if not cid:
@@ -1192,14 +1121,6 @@ async def check_channels(app: Client, m: Message):
             lines.append(f"✅ {label} (<code>{cid}</code>): resolved — {chat.title}")
         except Exception as e:
             lines.append(f"❌ {label} (<code>{cid}</code>): {type(e).__name__}: {e}")
-
-    dynamic = [d["_id"] async for d in repost_channels_col.find({})]
-    for cid in dynamic:
-        try:
-            chat = await app.get_chat(cid)
-            lines.append(f"✅ post channel (<code>{cid}</code>): resolved — {chat.title}")
-        except Exception as e:
-            lines.append(f"❌ post channel (<code>{cid}</code>): {type(e).__name__}: {e}")
 
     await m.reply("<b>🔍 Channel check:</b>\n\n" + "\n".join(lines))
 
@@ -1212,35 +1133,16 @@ async def list_dumps(_, m):
 
 
 @Client.on_message(filters.command("addpost") & filters.user(OWNER_ID))
-async def addpost(app: Client, m):
-    """FIX (bug: private repost channels failing with 'Peer id invalid'):
-    Adding a channel here used to just store the ID/username in Mongo
-    without ever asking Pyrogram to resolve it. Public channels/usernames
-    tend to resolve fine later via username lookup, but private
-    channels/groups only work once Pyrogram has cached their access_hash —
-    which requires an explicit get_chat() (or some other interaction) at
-    least once. Without that, _run_admin_repost's later send_photo/
-    send_video calls fail with PeerIdInvalid even though the numeric ID is
-    100% correct. Now we resolve (and cache) the peer right when it's
-    added, and tell the admin immediately if that fails (e.g. bot isn't a
-    member/admin of that private channel yet)."""
+async def addpost(_, m):
     parts = m.text.split()[1:]
     if not parts:
         return await m.reply("⚠️ Usage: <code>/addpost -100xxxx channelusername ...</code>")
-    added, failed = [], []
+    added = []
     for p in parts:
         cid = _parse_channel_ref(p)
-        try:
-            await app.get_chat(cid)  # forces peer resolution/caching
-        except Exception as e:
-            failed.append(f"{cid} ({type(e).__name__}: {e})")
-            continue
         await add_repost_channel(cid)
         added.append(str(cid))
-    text = (f"✅ Added: <code>{', '.join(added)}</code>\n" if added else "") + \
-           (f"❌ Couldn't resolve (make sure the bot is a member/admin there): "
-            f"<code>{', '.join(failed)}</code>" if failed else "")
-    await m.reply(text or "Nothing to add.")
+    await m.reply(f"✅ Added post channel(s): <code>{', '.join(added)}</code>")
 
 
 @Client.on_message(filters.command("delpost") & filters.user(OWNER_ID))
@@ -1495,20 +1397,18 @@ async def process_link(app: Client, m: Message, link: str, idx: int, total: int)
             except Exception:
                 pass
 
+RE = re.compile(
+    r"https?://(?:www\.)?(?:diskwala\.com/app/[A-Za-z0-9]+|flezen\.com/s/[A-Za-z0-9]+)",
+    re.I
+)
+
 
 async def store_video_for_link(app: Client, link: str, status_msg: Message, tag: str):
     """Triggers @Diskwaladsbot for a link (skipping ones already cached) and
     caches the reference to the video it uploads into VIDEO_STORAGE_CHANNEL
     — no local download/re-upload needed. Populates the same shared cache
     process_link() uses, so later /start deep-link requests for this link
-    are served instantly via copy instead of re-fetching.
-
-    NOTE: relies on the module-level RE regex to extract the link. That
-    regex was previously too narrow ([A-Za-z0-9]+ for the ID) and truncated
-    IDs containing '-'/'_', causing distinct links to collide on the same
-    cache key and return an old cached video instead of fetching the new
-    one. Fixed at the RE definition near the top of this file — no change
-    needed here, this function was just downstream of that bug."""
+    are served instantly via copy instead of re-fetching."""
     if await get_cache(link):
         return  # already stored previously
 
@@ -1600,20 +1500,8 @@ async def _run_admin_repost(app: Client, m: Message, matches):
             buttons.append([InlineKeyboardButton(panel["button_text"], url=panel["button_url"])])
         button_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
-        # FIX (bug: "Peer id invalid" on private repost channels):
-        # get_chat() forces Pyrogram to resolve/cache the peer (fetching its
-        # access_hash) right before we try to send to it. Public channels
-        # often "just worked" before because username-based lookups resolve
-        # more forgivingly, but private channels/groups need this explicit
-        # resolution — without it Telegram rejects the send with
-        # PeerIdInvalid even when the numeric ID is completely correct.
-        # /addpost now also does this at add-time (see addpost handler),
-        # so this is a second safety net in case the bot's in-memory peer
-        # cache was cleared (e.g. after a restart) since the channel was
-        # added.
         for channel in post_channels:
             try:
-                await app.get_chat(channel)
                 if m.photo:
                     await app.send_photo(
                         channel, m.photo.file_id, caption=new_caption,
@@ -1625,10 +1513,7 @@ async def _run_admin_repost(app: Client, m: Message, matches):
                         reply_markup=button_markup, parse_mode=ParseMode.HTML,
                     )
             except Exception as e:
-                await status.reply(
-                    f"⚠️ Failed to post to <code>{channel}</code>: {e}\n"
-                    f"(If this is a private channel/group, make sure the bot is a member/admin there.)"
-                )
+                await status.reply(f"⚠️ Failed to post to <code>{channel}</code>: {e}")
 
         await status.edit_text(
             f"<b>✅ Stored {total} video(s) and reposted to {len(post_channels)} channel(s).</b>"
