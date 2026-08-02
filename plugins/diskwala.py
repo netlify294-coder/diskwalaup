@@ -1263,7 +1263,19 @@ async def ignore_cb(_, cq):
 
 async def deliver_stream_only(m: Message, msg: Message, link: str, tag: str):
     try:
-        vid_msg = await fetch_via_diskwaladsbot(link)
+        cached = await get_cache(link)
+        if cached:
+            _dab_logger.info(f"stream-only cache HIT for link={link!r}")
+            vid_msg = await m._client.get_messages(cached["chat_id"], cached["message_id"])
+        else:
+            _dab_logger.info(f"stream-only cache MISS for link={link!r} — fetching fresh")
+            vid_msg = await fetch_via_diskwaladsbot(link)
+            media = vid_msg.video or vid_msg.document
+            await save_cache(
+                link, VIDEO_STORAGE_CHANNEL, vid_msg.id,
+                (media.file_name if media else None) or "video.mp4",
+                (media.file_size if media else 0) or 0,
+            )
 
         media = vid_msg.video or vid_msg.document
         file_name = (media.file_name if media else None) or "video.mp4"
@@ -1460,7 +1472,7 @@ async def _run_admin_repost(app: Client, m: Message, matches):
                 "⚠️ Set VIDEO_STORAGE_CHANNEL env var and add at least one "
                 "post channel with /addpost first."
             )
-            raise StopPropagation
+            return
 
         links = [mm.group(0) for mm in matches]
         total = len(links)
@@ -1472,7 +1484,7 @@ async def _run_admin_repost(app: Client, m: Message, matches):
                 await store_video_for_link(app, link, status, tag)
             except Exception as e:
                 await status.edit_text(f"<b>❌ Failed on {tag}</b>\n<code>{e}</code>")
-                raise StopPropagation
+                return
 
         me = await app.get_me()
         video_code = await create_short_code(links, kind="video")
@@ -1506,7 +1518,6 @@ async def _run_admin_repost(app: Client, m: Message, matches):
         await status.edit_text(
             f"<b>✅ Stored {total} video(s) and reposted to {len(post_channels)} channel(s).</b>"
         )
-        raise StopPropagation
 
 
 
