@@ -56,7 +56,7 @@ RE = re.compile(
     r"https?://(?:www\.)?(?:diskwala\.com/app/[\w-]+|flezen\.com/s/[\w-]+)",
     re.I
 )
-CMDS = ["start", "stats", "adddump", "deldump", "dumps", "addpaid", "delpremium", "premium","broadcast", "link", "panel", "checkchannels", "addpost", "delpost", "postchannels"]
+CMDS = ["start", "stats", "adddump", "deldump", "dumps", "addpaid", "delpremium", "premium","broadcast", "link", "panel", "checkchannels", "addpost", "delpost", "postchannels", "clearcache"]
 
 _raw_logger = logging.getLogger("raw_updates")
 
@@ -1107,6 +1107,44 @@ async def addpaid(client, m):
     if not notified:
         text += "\n🔕 Couldn't DM the user (blocked bot / never started chat)."
     await m.reply(text)
+
+
+# FIX (root cause of "problem still not solved" after the matching fix):
+# The multi-link matching fix only prevents NEW wrong mappings from being
+# created — it does nothing for links that were ALREADY cached with a wrong
+# video before the fix went live. try_deliver_from_cache() / deliver_stream_only()
+# check the Mongo cache FIRST and return early on a HIT without ever calling
+# fetch_via_diskwaladsbot() again — so a poisoned cache entry keeps serving
+# the same wrong video forever, completely bypassing the fix.
+# /clearcache <link> removes one poisoned entry so it gets re-fetched fresh
+# (correctly) on next request. /clearcache all wipes every cached entry —
+# use once after deploying the fix to guarantee no old bad mappings remain,
+# then rely on selective clears afterward.
+@Client.on_message(filters.command("clearcache") & filters.user(OWNER_ID))
+async def clearcache(_, m):
+    parts = m.text.split()[1:]
+    if not parts:
+        return await m.reply(
+            "⚠️ Usage:\n"
+            "<code>/clearcache https://www.diskwala.com/app/xxxxx</code> — clear one link\n"
+            "<code>/clearcache all</code> — wipe the ENTIRE cache (use once after a fix deploy)"
+        )
+
+    if parts[0].lower() == "all":
+        result = await cache_col.delete_many({})
+        return await m.reply(f"🗑️ Cleared <b>{result.deleted_count}</b> cached link(s). Everything will re-fetch fresh now.")
+
+    cleared, missing = [], []
+    for link in parts:
+        res = await cache_col.delete_one({"_id": link})
+        (cleared if res.deleted_count else missing).append(link)
+
+    text = ""
+    if cleared:
+        text += f"🗑️ Cleared {len(cleared)} link(s):\n" + "\n".join(f"<code>{l}</code>" for l in cleared) + "\n\n"
+    if missing:
+        text += f"ℹ️ Not in cache (nothing to clear): {len(missing)} link(s)"
+    await m.reply(text or "Nothing to clear.")
 
 
 @Client.on_message(filters.command("delpremium") & filters.user(OWNER_ID))
